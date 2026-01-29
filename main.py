@@ -1,72 +1,316 @@
-from fastapi import FastAPI
+"""
+UniTicket FastAPI AI Service
+
+提供 RAG 问答服务，使用 FAISS 向量检索 + DeepSeek LLM
+"""
+
+import logging
+import sys
+import time
+from contextlib import asynccontextmanager
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from langchain_openai import ChatOpenAI
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
-import uvicorn
-import time
 
-app = FastAPI()
-
-# 1. 加载本地向量索引（必须与 ingest 保持一致）
-embeddings = OllamaEmbeddings(model="mxbai-embed-large")
-vectorstore = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-
-# 2. 初始化 DeepSeek API (对话不吃内存)
-llm = ChatOpenAI(
-    model='deepseek-chat',
-    openai_api_key="sk-849ad16616534e628f0498952b93cc6c", # 填入你申请的 Key
-    openai_api_base="https://api.deepseek.com/v1",
-    temperature=0
+from config import AIServiceError, LLMError, config
+from vector_store import vector_store_manager
+from schemas import (
+    AskRequest,
+    AskResponse,
+    HealthCheckResponse,
+    ErrorResponse
 )
 
-# 3. 定义文档格式化函数
-def format_docs(docs):
-    return "\n\n".join([f"【文档{i+1}】\n{doc.page_content}" for i, doc in enumerate(docs)])
 
-# 4. RAG 链配置 (使用 LCEL 构建更清晰的链)
-system_prompt = """你是 UniTicket 助手。请根据以下检索到的上下文信息回答用户问题。
+# ============================================================================
+# 日志配置
+# ============================================================================
 
-上下文信息：
-{context}
+def setup_logging() -> logging.Logger:
+    """配置结构化日志"""
+    logger = logging.getLogger("uniticket-ai")
+    handler = logging.StreamHandler(sys.stdout)
 
-请严格基于上述上下文回答问题。如果上下文中没有相关信息，请明确告知用户上下文中未包含相关内容。
+    if config.LOG_FORMAT == 'json':
+        # JSON 格式日志（生产环境推荐）
+        try:
+            from pythonjsonlogger import jsonlogger
+            formatter = jsonlogger.JsonFormatter(
+                '%(asctime)s %(name)s %(levelname)s %(message)s'
+            )
+        except ImportError:
+            # 如果 pythonjsonlogger 不可用，回退到文本格式
+            formatter = logging.Formatter(
+                '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+    else:
+        # 文本格式日志（开发环境）
+        formatter = logging.Formatter(
+            '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
 
-用户问题：{question}"""
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(getattr(logging, config.LOG_LEVEL.upper(), logging.INFO))
 
-prompt = ChatPromptTemplate.from_messages([
-    ("system", system_prompt),
-    ("human", "{question}")
-])
+    return logger
 
-# 构建完整的 RAG 链
-rag_chain = (
-    {"context": retriever | format_docs, "question": RunnablePassthrough()}
-    | prompt
-    | llm
-    | StrOutputParser()
+
+logger = setup_logging()
+
+
+# ============================================================================
+# 全局状态
+# ============================================================================
+
+class GlobalState:
+    """全局应用状态"""
+
+    def __init__(self):
+        self.vector_store_loaded = False
+        self.llm: ChatOpenAI = None
+        self.rag_chain = None
+
+    def is_ready(self) -> bool:
+        """服务是否就绪"""
+        return self.vector_store_loaded and self.llm is not None
+
+
+state = GlobalState()
+
+
+# ============================================================================
+# 异常处理器
+# ============================================================================
+
+async def aiservice_exception_handler(request: Request, exc: AIServiceError) -> JSONResponse:
+    """AI 服务异常处理器"""
+    error_type = exc.__class__.__name__
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=ErrorResponse(
+            error=error_type,
+            message=str(exc),
+            detail=repr(exc) if config.LOG_LEVEL == 'DEBUG' else None
+        ).model_dump()
+    )
+
+
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """HTTP 异常处理器"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ErrorResponse(
+            error="HTTPError",
+            message=exc.detail
+        ).model_dump()
+    )
+
+
+async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """通用异常处理器"""
+    logger.exception(f"未处理的异常: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=ErrorResponse(
+            error="InternalServerError",
+            message="服务器内部错误",
+            detail=str(exc) if config.LOG_LEVEL == 'DEBUG' else None
+        ).model_dump()
+    )
+
+
+# ============================================================================
+# 应用生命周期
+# ============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    # 启动时执行
+    logger.info("=" * 60)
+    logger.info("UniTicket AI Service 启动中...")
+    logger.info("=" * 60)
+
+    try:
+        # 1. 验证配置
+        logger.info("[1/3] 验证配置...")
+        config.validate()
+
+        # 2. 加载向量存储
+        logger.info("[2/3] 加载向量存储...")
+        index_path = config.get_index_path()
+        vector_store_manager.load(index_path)
+        metadata = vector_store_manager.metadata
+        logger.info(f"向量存储加载成功: {index_path}")
+        logger.info(f"索引版本: {metadata.get('version')}")
+        logger.info(f"索引模型: {metadata.get('model')}")
+        state.vector_store_loaded = True
+
+        # 3. 初始化 LLM
+        logger.info("[3/3] 初始化 LLM...")
+        state.llm = ChatOpenAI(
+            model=config.DEEPSEEK_MODEL,
+            api_key=config.DEEPSEEK_API_KEY,
+            base_url=config.DEEPSEEK_API_BASE,
+            temperature=config.DEEPSEEK_TEMPERATURE
+        )
+        logger.info(f"LLM 初始化成功: {config.DEEPSEEK_MODEL}")
+
+        logger.info("=" * 60)
+        logger.info("服务启动完成，准备接受请求")
+        logger.info("=" * 60)
+
+    except Exception as e:
+        logger.error(f"服务启动失败: {e}")
+        raise
+
+    yield
+
+    # 关闭时执行
+    logger.info("服务关闭中...")
+
+
+# ============================================================================
+# FastAPI 应用
+# ============================================================================
+
+app = FastAPI(
+    title="UniTicket AI Service",
+    description="基于 RAG 的智能问答服务",
+    version="1.0.0",
+    lifespan=lifespan
 )
 
-@app.get("/ai/ask")
-async def ask_ai(question: str):
-    start = time.time()
+# 注册异常处理器
+app.add_exception_handler(AIServiceError, aiservice_exception_handler)
+app.add_exception_handler(HTTPException, http_exception_handler)
+app.add_exception_handler(Exception, generic_exception_handler)
 
-    # 先检索以便打印调试信息
-    search_results = retriever.invoke(question)
-    print(f"\n[DEBUG] 检索到的文档数量: {len(search_results)}")
-    for i, doc in enumerate(search_results):
-        print(f"[DEBUG] 匹配到的第 {i+1} 条内容:\n{doc.page_content}\n")
 
-    # 执行 RAG
-    answer = rag_chain.invoke(question)
+# ============================================================================
+# 辅助函数
+# ============================================================================
 
-    elapsed = (time.time() - start) * 1000  # 转换为毫秒
-    print(f"[PERF] 总响应时间: {elapsed:.2f}ms\n")
+def format_docs(docs) -> str:
+    """格式化检索到的文档"""
+    return "\n\n".join([
+        f"【文档{i+1}】\n{doc.page_content}"
+        for i, doc in enumerate(docs)
+    ])
 
-    return {"answer": answer}
+
+def create_rag_chain(retriever, question: str):
+    """创建 RAG 链"""
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", config.SYSTEM_PROMPT),
+        ("human", "{question}")
+    ])
+
+    return (
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | prompt
+        | state.llm
+        | StrOutputParser()
+    )
+
+
+# ============================================================================
+# API 路由
+# ============================================================================
+
+@app.get(
+    "/health",
+    response_model=HealthCheckResponse,
+    summary="健康检查",
+    description="检查服务状态和组件健康情况"
+)
+async def health_check():
+    """健康检查接口"""
+    metadata = None
+    if state.vector_store_loaded:
+        try:
+            metadata = vector_store_manager.metadata
+        except Exception:
+            pass
+
+    return HealthCheckResponse(
+        status="healthy" if state.is_ready() else "unhealthy",
+        index_loaded=state.vector_store_loaded,
+        index_version=metadata.get('version') if metadata else None,
+        embedding_model=metadata.get('model') if metadata else None,
+        llm_model=config.DEEPSEEK_MODEL if state.llm else None
+    )
+
+
+@app.post(
+    "/ai/ask",
+    response_model=AskResponse,
+    summary="AI 问答",
+    description="使用 RAG 进行智能问答"
+)
+async def ask_ai(request: AskRequest):
+    """
+    AI 问答接口
+
+    - **question**: 用户问题
+    - **top_k**: 检索的文档数量（默认 5）
+    """
+    if not state.is_ready():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="服务未就绪，请稍后重试"
+        )
+
+    start_time = time.time()
+
+    try:
+        # 获取检索器
+        retriever = vector_store_manager.get_retriever(
+            search_kwargs={"k": request.top_k}
+        )
+
+        # 先检索以便记录
+        search_results = retriever.invoke(request.question)
+        logger.info(f"检索到 {len(search_results)} 条相关文档")
+
+        # 执行 RAG
+        rag_chain = create_rag_chain(retriever, request.question)
+        answer = rag_chain.invoke(request.question)
+
+        latency_ms = (time.time() - start_time) * 1000
+
+        logger.info(f"问答完成，耗时 {latency_ms:.2f}ms")
+
+        return AskResponse(
+            answer=answer,
+            latency_ms=round(latency_ms, 2),
+            retrieval_count=len(search_results),
+            index_version=vector_store_manager.metadata.get('version'),
+            model_version=vector_store_manager.metadata.get('model')
+        )
+
+    except Exception as e:
+        logger.exception(f"问答处理失败: {e}")
+        raise LLMError(f"问答处理失败: {e}") from e
+
+
+# ============================================================================
+# 主函数
+# ============================================================================
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        "main:app",
+        host=config.FASTAPI_HOST,
+        port=config.FASTAPI_PORT,
+        reload=config.FASTAPI_RELOAD,
+        log_config=None  # 使用自定义日志配置
+    )
