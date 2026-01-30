@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import hashlib
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any
@@ -23,6 +24,7 @@ from dotenv import load_dotenv
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # 加载环境变量
 load_dotenv()
@@ -46,6 +48,10 @@ class Config:
 
     # 最大保留的历史索引数量
     MAX_HISTORY_COUNT = int(os.getenv('MAX_HISTORY_COUNT', '5'))
+
+    # 文档切分配置
+    CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '500'))
+    CHUNK_OVERLAP = int(os.getenv('CHUNK_OVERLAP', '80'))
 
 
 # ============================================================================
@@ -161,7 +167,23 @@ def fetch_events_from_db(db_config: Dict[str, Any]) -> list[Document]:
                 f"详情介绍: {row['description']}\n"
                 f"相关标签: {row['tags']}"
             )
-            documents.append(Document(page_content=content, metadata={"source": "mysql"}))
+            doc_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+            doc_key = f"{row['event_name']}|{row['event_time']}|{row['venue']}"
+            documents.append(
+                Document(
+                    page_content=content,
+                    metadata={
+                        "source": "mysql",
+                        "event_name": row["event_name"],
+                        "category": row["category"],
+                        "venue": row["venue"],
+                        "event_time": str(row["event_time"]),
+                        "tags": row["tags"],
+                        "doc_key": doc_key,
+                        "doc_hash": doc_hash
+                    }
+                )
+            )
 
         print(f"从数据库成功提取 {len(documents)} 条活动数据")
         return documents
@@ -235,23 +257,35 @@ def get_ingest_state_path() -> Path:
     return Config.INDEX_ROOT_DIR / 'ingest_state.json'
 
 
-def load_ingest_state() -> set[str]:
-    """加载已导入文档的哈希集合"""
+def load_ingest_state() -> Dict[str, Any]:
+    """加载已导入文档的状态"""
     state_path = get_ingest_state_path()
     if not state_path.exists():
-        return set()
+        return {"documents": {}, "legacy_hashes": set()}
+
     with open(state_path, 'r', encoding='utf-8') as f:
         state = json.load(f)
-    return set(state.get('hashes', []))
+
+    documents = state.get('documents', {})
+    legacy_hashes = set(state.get('hashes', []))
+
+    return {
+        "documents": documents,
+        "legacy_hashes": legacy_hashes
+    }
 
 
-def save_ingest_state(hashes: set[str], latest_index_dir: Path) -> None:
-    """保存已导入文档的哈希集合"""
+def save_ingest_state(documents: Dict[str, str], latest_index_dir: Path) -> None:
+    """保存已导入文档的状态"""
     Config.INDEX_ROOT_DIR.mkdir(parents=True, exist_ok=True)
     state_path = get_ingest_state_path()
     payload = {
-        'hashes': sorted(hashes),
-        'latest_index': latest_index_dir.name
+        'documents': documents,
+        'latest_index': latest_index_dir.name,
+        'chunk_config': {
+            'chunk_size': Config.CHUNK_SIZE,
+            'chunk_overlap': Config.CHUNK_OVERLAP
+        }
     }
     with open(state_path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, ensure_ascii=True, indent=2)
@@ -274,16 +308,81 @@ def get_latest_index_dir() -> Path | None:
     return index_dirs[0] if index_dirs else None
 
 
-def filter_new_documents(documents: list[Document], existing_hashes: set[str]) -> tuple[list[Document], set[str]]:
-    """基于内容哈希过滤新增文档"""
+def analyze_documents(
+    documents: list[Document],
+    state: Dict[str, Any]
+) -> tuple[list[Document], list[Document], Dict[str, str]]:
+    """判断新增/变更文档并返回最新的文档哈希映射"""
+    existing = state.get("documents", {})
+    legacy_hashes = state.get("legacy_hashes", set())
+
     new_docs = []
-    new_hashes = set()
+    updated_docs = []
+    latest_mapping: Dict[str, str] = {}
+
     for doc in documents:
-        h = hashlib.sha256(doc.page_content.encode('utf-8')).hexdigest()
-        if h not in existing_hashes:
+        doc_key = doc.metadata.get("doc_key")
+        doc_hash = doc.metadata.get("doc_hash")
+        if not doc_key or not doc_hash:
+            continue
+
+        latest_mapping[doc_key] = doc_hash
+
+        if doc_key in existing:
+            if existing[doc_key] != doc_hash:
+                updated_docs.append(doc)
+        elif doc_hash in legacy_hashes:
+            # 兼容旧状态（只有 hash 列表）
+            continue
+        else:
             new_docs.append(doc)
-            new_hashes.add(h)
-    return new_docs, new_hashes
+
+    return new_docs, updated_docs, latest_mapping
+
+
+def create_text_splitter() -> RecursiveCharacterTextSplitter:
+    """创建文本切分器"""
+    return RecursiveCharacterTextSplitter(
+        chunk_size=Config.CHUNK_SIZE,
+        chunk_overlap=Config.CHUNK_OVERLAP
+    )
+
+
+def split_documents(documents: list[Document]) -> list[Document]:
+    """将文档切分为 chunk，并保留元数据"""
+    splitter = create_text_splitter()
+    chunked_docs = []
+    for doc in documents:
+        chunks = splitter.split_text(doc.page_content)
+        chunk_total = len(chunks)
+        for index, chunk in enumerate(chunks):
+            metadata = dict(doc.metadata)
+            metadata.update({
+                "chunk_index": index,
+                "chunk_total": chunk_total
+            })
+            chunked_docs.append(Document(page_content=chunk, metadata=metadata))
+    return chunked_docs
+
+
+def build_metadata_summary(documents: list[Document], chunked_docs: list[Document]) -> Dict[str, Any]:
+    """构建元数据统计摘要"""
+    categories = Counter()
+    venues = Counter()
+    for doc in documents:
+        if "category" in doc.metadata:
+            categories[doc.metadata["category"]] += 1
+        if "venue" in doc.metadata:
+            venues[doc.metadata["venue"]] += 1
+
+    return {
+        "total_documents": len(documents),
+        "total_chunks": len(chunked_docs),
+        "chunk_size": Config.CHUNK_SIZE,
+        "chunk_overlap": Config.CHUNK_OVERLAP,
+        "top_categories": categories.most_common(10),
+        "top_venues": venues.most_common(10)
+    }
 
 
 def load_or_create_vectorstore(
@@ -327,7 +426,11 @@ def get_index_dir() -> Path:
     return Config.INDEX_ROOT_DIR / dir_name
 
 
-def save_model_metadata(index_dir: Path, embedding_config: Dict[str, str]) -> None:
+def save_model_metadata(
+    index_dir: Path,
+    embedding_config: Dict[str, str],
+    summary: Dict[str, Any]
+) -> None:
     """
     保存模型元数据到索引目录
 
@@ -340,7 +443,8 @@ def save_model_metadata(index_dir: Path, embedding_config: Dict[str, str]) -> No
         'model': embedding_config['model'],
         'base_url': embedding_config['base_url'],
         'created_at': datetime.now().isoformat(),
-        'description': 'UniTicket 活动向量库'
+        'description': 'UniTicket 活动向量库',
+        'data_summary': summary
     }
 
     metadata_file = index_dir / 'model_metadata.json'
@@ -379,7 +483,8 @@ def cleanup_old_indexes() -> None:
 
 def save_vectorstore(
     vectorstore: FAISS,
-    embedding_config: Dict[str, str]
+    embedding_config: Dict[str, str],
+    summary: Dict[str, Any]
 ) -> Path:
     """
     保存向量库到带版本信息的目录
@@ -402,7 +507,7 @@ def save_vectorstore(
         vectorstore.save_local(str(index_dir))
 
         # 保存模型元数据
-        save_model_metadata(index_dir, embedding_config)
+        save_model_metadata(index_dir, embedding_config, summary)
 
         # 创建最新版本的符号链接
         latest_link = Config.INDEX_ROOT_DIR / 'latest'
@@ -443,44 +548,59 @@ def main() -> None:
 
     try:
         # 1. 获取配置
-        print("\n[1/5] 加载配置...")
+        print("\n[1/6] 加载配置...")
         db_config = get_db_config()
         embedding_config = get_embedding_config()
         print(f"数据库: {db_config['host']}:{db_config['port']}/{db_config['database']}")
         print(f"Embedding 模型: {embedding_config['model']}")
 
         # 2. 从数据库提取数据
-        print("\n[2/5] 从数据库提取数据...")
+        print("\n[2/6] 从数据库提取数据...")
         documents = fetch_events_from_db(db_config)
 
         if not documents:
             print("警告: 没有数据可以向量化，程序退出")
             return
 
-        # 3. 增量过滤
-        print("\n[3/4] 增量过滤...")
-        existing_hashes = load_ingest_state()
-        new_documents, new_hashes = filter_new_documents(documents, existing_hashes)
-        print(f"本次新增 {len(new_documents)} 条，已存在 {len(documents) - len(new_documents)} 条")
-
-        if not new_documents:
-            print("没有新增数据，向量库无需更新")
-            return
-
-        # 4. 创建/增量更新向量库
-        print("\n[4/4] 创建/更新向量库...")
-        embeddings = create_embeddings(embedding_config)
-        vectorstore = load_or_create_vectorstore(
-            new_documents,
-            documents,
-            embeddings,
-            embedding_config
+        # 3. 增量分析
+        print("\n[3/6] 增量分析...")
+        ingest_state = load_ingest_state()
+        new_documents, updated_documents, latest_mapping = analyze_documents(documents, ingest_state)
+        print(
+            f"本次新增 {len(new_documents)} 条，"
+            f"变更 {len(updated_documents)} 条，"
+            f"已存在 {len(documents) - len(new_documents) - len(updated_documents)} 条"
         )
 
-        # 5. 保存向量库
-        print("\n[5/5] 保存向量库...")
-        index_dir = save_vectorstore(vectorstore, embedding_config)
-        save_ingest_state(existing_hashes.union(new_hashes), index_dir)
+        if not new_documents and not updated_documents:
+            print("没有新增或变更数据，向量库无需更新")
+            return
+
+        # 4. 文档切分
+        print("\n[4/6] 文档切分...")
+        all_chunks = split_documents(documents)
+        summary = build_metadata_summary(documents, all_chunks)
+
+        # 5. 创建/增量更新向量库
+        print("\n[5/6] 创建/更新向量库...")
+        embeddings = create_embeddings(embedding_config)
+        if updated_documents:
+            print("检测到变更文档，执行全量重建")
+            vectorstore = create_vectorstore(all_chunks, embeddings, embedding_config)
+        else:
+            new_doc_keys = {doc.metadata.get("doc_key") for doc in new_documents}
+            new_chunks = [doc for doc in all_chunks if doc.metadata.get("doc_key") in new_doc_keys]
+            vectorstore = load_or_create_vectorstore(
+                new_chunks,
+                all_chunks,
+                embeddings,
+                embedding_config
+            )
+
+        # 6. 保存向量库
+        print("\n[6/6] 保存向量库...")
+        index_dir = save_vectorstore(vectorstore, embedding_config, summary)
+        save_ingest_state(latest_mapping, index_dir)
 
         print("\n" + "=" * 60)
         print("向量库构建完成!")
