@@ -5,6 +5,7 @@ UniTicket FastAPI AI Service
 """
 
 import logging
+import re
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -222,6 +223,60 @@ def create_rag_chain(retriever, question: str):
     )
 
 
+def run_rag_with_docs(question: str, docs) -> str:
+    """使用指定文档上下文执行 RAG"""
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", config.SYSTEM_PROMPT),
+        ("human", "{question}")
+    ])
+    context = format_docs(docs)
+    chain = prompt | state.llm | StrOutputParser()
+    return chain.invoke({"context": context, "question": question})
+
+
+def tokenize_query(text: str) -> set[str]:
+    """轻量分词：英文/数字按词，中文按单字"""
+    tokens = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", text.lower())
+    normalized = set()
+    for token in tokens:
+        if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+            normalized.update(list(token))
+        else:
+            normalized.add(token)
+    return normalized
+
+
+def score_doc(doc, query_tokens: set[str]) -> int:
+    """基于词匹配的轻量打分，带元数据加权"""
+    if not query_tokens:
+        return 0
+
+    content = doc.page_content.lower()
+    score = sum(1 for t in query_tokens if t and t in content)
+
+    metadata = doc.metadata or {}
+    for key in ("event_name", "category", "venue", "tags"):
+        value = str(metadata.get(key, "")).lower()
+        if value and any(t in value for t in query_tokens):
+            score += 3
+
+    return score
+
+
+def rerank_docs(docs, query: str, top_k: int):
+    """以最小性能代价对召回结果做轻量重排"""
+    if not docs:
+        return []
+
+    query_tokens = tokenize_query(query)
+    if not query_tokens:
+        return docs[:top_k]
+
+    scored = [(score_doc(doc, query_tokens), idx, doc) for idx, doc in enumerate(docs)]
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [doc for _, _, doc in scored[:top_k]]
+
+
 # ============================================================================
 # API 路由
 # ============================================================================
@@ -272,18 +327,22 @@ async def ask_ai(request: AskRequest):
     start_time = time.time()
 
     try:
-        # 获取检索器
+        # 获取检索器（扩大召回以供重排）
+        recall_k = min(request.top_k * 3, 30)
         retriever = vector_store_manager.get_retriever(
-            search_kwargs={"k": request.top_k}
+            search_kwargs={"k": recall_k}
         )
 
         # 先检索以便记录
         search_results = retriever.invoke(request.question)
         logger.info(f"检索到 {len(search_results)} 条相关文档")
 
+        # 轻量重排
+        reranked_results = rerank_docs(search_results, request.question, request.top_k)
+        logger.info(f"重排后保留 {len(reranked_results)} 条文档")
+
         # 执行 RAG
-        rag_chain = create_rag_chain(retriever, request.question)
-        answer = rag_chain.invoke(request.question)
+        answer = run_rag_with_docs(request.question, reranked_results)
 
         latency_ms = (time.time() - start_time) * 1000
 
