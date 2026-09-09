@@ -9,31 +9,31 @@ Python · FastAPI · LangChain/LCEL · Ollama · FAISS · DeepSeek · MySQL
 Campus-AI converts structured campus-event records into a versioned FAISS index and exposes a REST API used by the [UniTicket](https://github.com/zljny11/uniticket) Spring Boot platform.
 
 ~~~mermaid
-flowchart TD
-    subgraph OFFLINE["Offline Indexing"]
-        DB[("MySQL Event Records")] --> ING["Incremental Ingestion"]
-        ING --> META["Content Hash + Metadata"]
-        META --> EMB["Ollama Embedding"]
-        EMB --> IDX[("Versioned FAISS Index")]
+flowchart LR
+    subgraph INDEX["Index Pipeline"]
+        direction TB
+        DB[("MySQL Events")] --> ING["Incremental Ingestion"]
+        ING --> EMB["Hash, Metadata and Embedding"]
+        EMB --> FAISS[("Versioned FAISS Index")]
     end
 
-    subgraph ONLINE["Online RAG Request"]
-        UNI["UniTicket Spring Boot"] -->|"REST"| API["FastAPI /ai/ask"]
-        API --> QE["Query Embedding"]
-        QE --> RET["Top-K Retrieval"]
-        IDX --> CHECK["Index / Model Validation"]
-        CHECK --> RET
-        RET --> FILTER["Metadata Filtering + Reranking"]
-        FILTER --> CTX["Structured Context Selection"]
-        CTX --> LLM["DeepSeek-V3 Generation"]
-        LLM --> RES["Answer + Sources + Metadata"]
-        RES --> UNI
+    subgraph SERVICE["Retrieval Service"]
+        direction TB
+        APP["UniTicket Platform"] --> API["FastAPI REST API"]
+        API --> QUERY["Query Embedding"]
+        QUERY --> RET["Top-K Retrieval"]
+        RET --> RANK["Metadata Filter and Reranking"]
     end
 
-    subgraph EVALUATION["Evaluation"]
-        TEST["Fixed Evaluation Set"] --> PIPE["RAG Pipeline"]
-        PIPE --> RAGAS["Ragas Faithfulness"]
+    subgraph GENERATION["Answer Generation"]
+        direction TB
+        CONTEXT["Structured Context"]
+        CONTEXT --> LLM["DeepSeek-V3"]
+        LLM --> RESULT["Answer, Sources and Metadata"]
     end
+
+    FAISS --> RET
+    RANK --> CONTEXT
 ~~~
 
 ## Features
